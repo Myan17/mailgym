@@ -1,3 +1,16 @@
+---
+title: MailGym
+emoji: 📧
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+tags:
+  - openenv
+  - reinforcement-learning
+  - email-triage
+---
+
 # MailGym
 
 An OpenEnv-compliant reinforcement learning environment that simulates real-world email triage — a task every knowledge worker does daily. Agents must classify, prioritize, route, and draft responses to emails across three difficulty levels.
