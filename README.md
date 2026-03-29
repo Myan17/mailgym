@@ -1,3 +1,17 @@
+---
+title: MailGym
+emoji: 📧
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+tags:
+  - openenv
+  - reinforcement-learning
+  - email-triage
+---
+
+
 # MailGym
 
 An OpenEnv-compliant reinforcement learning environment that simulates real-world email triage — a task every knowledge worker does daily. Agents must classify, prioritize, route, and draft responses to emails across three difficulty levels.
@@ -93,7 +107,11 @@ docker run -p 7860:7860 mailgym:latest
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/` | Health check |
+| GET | `/` | Root health check |
+| GET | `/health` | OpenEnv health check (`{"status": "healthy"}`) |
+| GET | `/metadata` | Environment metadata (name, description, tasks) |
+| GET | `/schema` | JSON schemas for action, observation, state |
+| POST | `/mcp` | JSON-RPC 2.0 MCP endpoint (tools/list, tools/call) |
 | GET | `/tasks` | List available tasks |
 | POST | `/reset` | Start a new episode (`{"task_name": "classify_easy", "seed": 42}`) |
 | POST | `/step` | Submit action (`{"action": {"category": "spam", ...}}`) |
