@@ -151,11 +151,14 @@ mailgym/
 
 ## Baseline Scores
 
-| Task | Difficulty | Expected Score Range |
-|------|-----------|---------------------|
-| classify_easy | Easy | 0.70 – 0.90 |
-| triage_medium | Medium | 0.50 – 0.70 |
-| full_triage_hard | Hard | 0.30 – 0.60 |
+Model: `meta-llama/Llama-3.1-8B-Instruct` via HF Inference Router
+
+| Task | Difficulty | Score |
+|------|-----------|-------|
+| classify_easy | Easy | **1.00** |
+| triage_medium | Medium | **1.00** |
+| full_triage_hard | Hard | **0.90** |
+| **Average** | | **0.97** |
 
 Scores are reproducible with `seed=42` and `temperature=0.0`.
 
