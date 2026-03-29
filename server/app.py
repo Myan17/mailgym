@@ -2,11 +2,15 @@
 FastAPI server exposing the Email Triage environment via HTTP.
 
 Endpoints (OpenEnv-compliant):
-  POST /reset   — start a new episode
-  POST /step    — submit an action
-  GET  /state   — get current episode metadata
-  GET  /tasks   — list available tasks
-  GET  /        — health check
+  POST /reset    — start a new episode
+  POST /step     — submit an action
+  GET  /state    — get current episode metadata
+  GET  /tasks    — list available tasks
+  GET  /health   — health check (OpenEnv validator)
+  GET  /metadata — environment metadata (OpenEnv validator)
+  GET  /schema   — action/observation/state schemas (OpenEnv validator)
+  POST /mcp      — JSON-RPC MCP endpoint (OpenEnv validator)
+  GET  /         — basic health check
 """
 
 from __future__ import annotations
@@ -17,12 +21,13 @@ import os
 # Ensure the project root is on sys.path so we can import models
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from models import Observation, State, TriageAction
+
 from server.environment import EmailTriageEnvironment, VALID_TASK_NAMES
 
 # ── App ──────────────────────────────────────────────────────────────────────
@@ -74,11 +79,163 @@ class TaskListResponse(BaseModel):
     descriptions: dict[str, str]
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# ── OpenEnv Validator Endpoints ──────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    """OpenEnv health check — must return {"status": "healthy"}."""
+    return {"status": "healthy"}
+
+
+@app.get("/metadata")
+async def metadata():
+    """OpenEnv metadata — environment name, description, and tasks."""
+    from server.environment import TASK_DEFINITIONS
+
+    return {
+        "name": "mailgym",
+        "description": (
+            "An OpenEnv-compliant RL environment that simulates email triage. "
+            "Agents classify, prioritize, route, and draft responses to emails."
+        ),
+        "version": "1.0.0",
+        "tasks": [
+            {
+                "name": name,
+                "difficulty": td.difficulty,
+                "description": td.instructions,
+            }
+            for name, td in TASK_DEFINITIONS.items()
+        ],
+    }
+
+
+@app.get("/schema")
+async def schema():
+    """OpenEnv schema — JSON schemas for action, observation, and state."""
+    return {
+        "action": TriageAction.model_json_schema(),
+        "observation": Observation.model_json_schema(),
+        "state": State.model_json_schema(),
+    }
+
+
+@app.post("/mcp")
+async def mcp(request: Request):
+    """
+    JSON-RPC MCP endpoint required by OpenEnv validator.
+
+    Handles basic JSON-RPC 2.0 requests for tool discovery.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return {
+            "jsonrpc": "2.0",
+            "error": {"code": -32700, "message": "Parse error"},
+            "id": None,
+        }
+
+    request_id = body.get("id")
+    method = body.get("method", "")
+
+    if method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "result": {
+                "tools": [
+                    {
+                        "name": "reset",
+                        "description": "Reset the environment and start a new episode",
+                        "inputSchema": ResetRequest.model_json_schema(),
+                    },
+                    {
+                        "name": "step",
+                        "description": "Submit a triage action and receive graded result",
+                        "inputSchema": TriageAction.model_json_schema(),
+                    },
+                    {
+                        "name": "state",
+                        "description": "Get current episode metadata",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    },
+                ],
+            },
+            "id": request_id,
+        }
+
+    if method == "tools/call":
+        tool_name = body.get("params", {}).get("name", "")
+        arguments = body.get("params", {}).get("arguments", {})
+
+        if tool_name == "reset":
+            obs = env.reset(
+                task_name=arguments.get("task_name", "classify_easy"),
+                seed=arguments.get("seed"),
+            )
+            return {
+                "jsonrpc": "2.0",
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": obs.model_dump_json(),
+                        }
+                    ],
+                },
+                "id": request_id,
+            }
+
+        if tool_name == "step":
+            action = TriageAction(**arguments)
+            obs = env.step(action)
+            return {
+                "jsonrpc": "2.0",
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": obs.model_dump_json(),
+                        }
+                    ],
+                },
+                "id": request_id,
+            }
+
+        if tool_name == "state":
+            st = env.state()
+            return {
+                "jsonrpc": "2.0",
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": st.model_dump_json(),
+                        }
+                    ],
+                },
+                "id": request_id,
+            }
+
+        return {
+            "jsonrpc": "2.0",
+            "error": {"code": -32601, "message": f"Method not found: {tool_name}"},
+            "id": request_id,
+        }
+
+    # Default: method not found
+    return {
+        "jsonrpc": "2.0",
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+        "id": request_id,
+    }
+
+
+# ── Standard Endpoints ───────────────────────────────────────────────────────
 
 @app.get("/")
 async def health_check():
-    """Health check endpoint."""
+    """Root health check endpoint."""
     return {
         "status": "ok",
         "environment": "mailgym",
@@ -151,7 +308,8 @@ async def get_state():
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
+    """Entry point for `server` console script (required by OpenEnv validator)."""
     import uvicorn
 
     port = int(os.environ.get("PORT", "7860"))
@@ -162,3 +320,7 @@ if __name__ == "__main__":
         reload=False,
         workers=1,
     )
+
+
+if __name__ == "__main__":
+    main()
