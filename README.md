@@ -78,29 +78,91 @@ Penalties:
 - Missing required fields → immediate 0.0
 - No destructive actions possible (read-only email environment)
 
-## Setup and Usage
+## Quick Start (60 seconds)
 
-### Local Development
+Run the baseline agent against the **live HF Space** with zero setup beyond an HF token:
 
 ```bash
-# Install dependencies
+# 1. Clone
+git clone https://github.com/Myan17/mailgym.git
+cd mailgym
+
+# 2. Create a virtualenv (Python 3.10+ recommended)
+python3 -m venv .venv
+source .venv/bin/activate        # on Windows: .venv\Scripts\activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
 
-# Start the environment server
-cd mailgym
-python -m server.app
-
-# The server runs at http://localhost:7860
+# 4. Set your HF token and run
+export HF_TOKEN="hf_your_token_here"
+python inference.py
 ```
 
-### Docker
+That's it. The script will:
+- Target the live MailGym Space at `https://myan9417-mailgym.hf.space` by default
+- Run all 3 tasks (`classify_easy`, `triage_medium`, `full_triage_hard`)
+- Print `[START]` / `[STEP]` / `[END]` log lines (strict OpenEnv submission format)
+- Finish in under a minute on any machine
+
+Expected output:
+```
+[START] task=classify_easy env=mailgym model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action={"category":"urgent"} reward=1.00 done=true error=null
+[END] success=true steps=1 score=1.000 rewards=1.00
+... (two more task blocks)
+```
+
+> **Python version:** If you don't have 3.10+, use `/opt/homebrew/bin/python3.12`
+> (macOS Homebrew) or install from python.org. Python 3.9 works for the baseline
+> script but some optional tooling (e.g. the `openenv` CLI) requires 3.10+.
+
+> **Getting an HF token:** Go to [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens),
+> click **Create new token** → **Write** (simpler) or **Fine-grained** with at
+> least "Make calls to Inference Providers" enabled.
+
+---
+
+## Setup and Usage
+
+### Run the environment locally (instead of hitting the HF Space)
+
+Useful for development or if the HF Space is down:
 
 ```bash
-# Build
-docker build -t mailgym:latest -f server/Dockerfile .
+# Install dependencies (if not already)
+pip install -r requirements.txt
 
-# Run
+# Start the FastAPI server on port 7860
+uvicorn server.app:app --host 0.0.0.0 --port 7860
+
+# In another terminal, point inference.py at it
+export ENV_BASE_URL="http://localhost:7860"
+export HF_TOKEN="hf_..."
+python inference.py
+```
+
+### Run the environment via Docker
+
+```bash
+# Build the container from the repo root
+docker build -t mailgym:latest .
+
+# Run it
 docker run -p 7860:7860 mailgym:latest
+
+# In another terminal, run the baseline against the container
+export ENV_BASE_URL="http://localhost:7860"
+export HF_TOKEN="hf_..."
+python inference.py
+```
+
+### Validate OpenEnv compliance
+
+```bash
+pip install "git+https://github.com/meta-pytorch/openenv.git"   # Python 3.10+
+openenv validate
+# Expected: [OK] mailgym: Ready for multi-mode deployment
 ```
 
 ### API Endpoints
@@ -119,13 +181,57 @@ docker run -p 7860:7860 mailgym:latest
 
 ### Running the Baseline Inference Script
 
+The baseline script (`inference.py`) uses the OpenAI client against the HF
+Inference Router and emits strict `[START]` / `[STEP]` / `[END]` log lines —
+the format required by the OpenEnv submission validator.
+
+**Zero-config run (hits the live HF Space):**
+
 ```bash
 export API_BASE_URL="https://router.huggingface.co/v1"
-export MODEL_NAME="your-model-name"
-export HF_TOKEN="your-hf-token"
-export ENV_BASE_URL="http://localhost:7860"
+export MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+export HF_TOKEN="hf_your_token"
+python3 inference.py
+```
 
-python inference.py
+By default, `inference.py` targets the deployed MailGym HF Space at
+`https://myan9417-mailgym.hf.space` — no local server required.
+
+**With a local server (dev workflow):**
+
+```bash
+# Terminal 1 — start the env
+docker run -p 7860:7860 mailgym:latest
+
+# Terminal 2 — point inference at it
+export ENV_BASE_URL="http://localhost:7860"
+python3 inference.py
+```
+
+**Using `.env`:**
+
+```bash
+cp .env.example .env
+# edit .env → HF_TOKEN=hf_...
+set -a && source .env && set +a
+python3 inference.py
+```
+
+**Environment variables:**
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `API_BASE_URL` | no | `https://router.huggingface.co/v1` | LLM endpoint |
+| `MODEL_NAME` | no | `meta-llama/Llama-3.1-8B-Instruct` | Model identifier |
+| `HF_TOKEN` | **yes** | — | HF / OpenAI-compatible API key |
+| `ENV_BASE_URL` | no | `https://myan9417-mailgym.hf.space` | MailGym server URL (live Space by default) |
+
+**Expected stdout format (one block per task):**
+
+```
+[START] task=classify_easy env=mailgym model=meta-llama/Llama-3.1-8B-Instruct
+[STEP] step=1 action={"category":"urgent"} reward=1.00 done=true error=null
+[END] success=true steps=1 score=1.000 rewards=1.00
 ```
 
 ### Using the Python Client
@@ -151,15 +257,20 @@ with EmailTriageClient("http://localhost:7860") as client:
 ```
 mailgym/
 ├── openenv.yaml          # OpenEnv manifest
+├── Dockerfile            # Container build (used by HF Space)
 ├── models.py             # Pydantic models (Action, Observation, State)
 ├── client.py             # HTTP client for the environment
-├── inference.py          # Baseline inference script (OpenAI client)
+├── inference.py          # Baseline inference script (OpenAI client, strict stdout format)
 ├── pyproject.toml        # Project metadata and dependencies
 ├── requirements.txt      # Pip requirements
 ├── README.md             # This file
+├── CLAUDE.md             # Project brain file — read first in a new session
+├── .env.example          # Template for local secrets (copy to .env)
+├── .gitignore            # Ignores .env, caches, venv
+├── tests/                # Stress test suite
 └── server/
     ├── __init__.py
-    ├── app.py            # FastAPI server with /reset, /step, /state
+    ├── app.py            # FastAPI server with /reset, /step, /state, /health, /schema, /mcp
     ├── environment.py    # Core environment logic
     ├── data.py           # Synthetic email generator (20 templates)
     ├── graders.py        # Deterministic grading functions
@@ -169,16 +280,31 @@ mailgym/
 
 ## Baseline Scores
 
-Model: `meta-llama/Llama-3.1-8B-Instruct` via HF Inference Router
+**Model:** `meta-llama/Llama-3.1-8B-Instruct` via HF Inference Router
+**Env target:** live HF Space (`https://myan9417-mailgym.hf.space`)
+**Config:** `seed=42`, `temperature=0.0`, `max_tokens=500`
 
-| Task | Difficulty | Score |
-|------|-----------|-------|
-| classify_easy | Easy | **1.00** |
-| triage_medium | Medium | **1.00** |
-| full_triage_hard | Hard | **0.90** |
-| **Average** | | **0.97** |
+| Task | Difficulty | Score | Success |
+|------|-----------|-------|---------|
+| classify_easy | Easy | **1.000** | ✅ |
+| triage_medium | Medium | **1.000** | ✅ |
+| full_triage_hard | Hard | **0.900** | ✅ |
+| **Average** | | **0.967** | |
 
-Scores are reproducible with `seed=42` and `temperature=0.0`.
+Scores are deterministic and reproduce on repeat runs with the same seed and
+temperature. Last verified end-to-end with the `inference.py` strict stdout
+format on 2026-04-06.
+
+### Reproducing the baseline
+
+```bash
+# From the repo root
+cp .env.example .env
+# edit .env → HF_TOKEN=hf_your_token
+
+set -a && source .env && set +a
+ENV_BASE_URL="https://myan9417-mailgym.hf.space" python3 inference.py
+```
 
 ## License
 

@@ -1,13 +1,29 @@
 """
-Inference Script — Email Triage OpenEnv Environment
-====================================================
+Inference Script — MailGym (Email Triage OpenEnv)
+==================================================
 MANDATORY ENVIRONMENT VARIABLES:
     API_BASE_URL   The API endpoint for the LLM.
     MODEL_NAME     The model identifier to use for inference.
     HF_TOKEN       Your Hugging Face / API key.
+    ENV_BASE_URL   The MailGym server URL (default: http://localhost:7860).
 
 This script uses the OpenAI Client for all LLM calls.
-It runs a baseline agent against all 3 tasks and prints reproducible scores.
+It runs a baseline agent across 3 tasks and emits the required stdout
+log format: [START] / [STEP] / [END].
+
+STDOUT FORMAT (strict)
+----------------------
+    [START] task=<task_name> env=mailgym model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
+
+Rules:
+    - One [START] per task, one [END] per task (always emitted, even on error).
+    - One [STEP] per env.step() call.
+    - reward / rewards formatted to 2 decimals, score to 3 decimals.
+    - done/success are lowercase booleans.
+    - error is the raw error string or the unquoted word null.
+    - action is single-line (no embedded newlines).
 """
 
 from __future__ import annotations
@@ -16,27 +32,35 @@ import json
 import os
 import sys
 import textwrap
+from typing import List, Optional
 
+import httpx
 from openai import OpenAI
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME")
+MODEL_NAME = os.getenv("MODEL_NAME") or "meta-llama/Llama-3.1-8B-Instruct"
 
-ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:7860")
+# Default to the live HF Space so `python inference.py` works with zero setup.
+# Override with ENV_BASE_URL=http://localhost:7860 for local development.
+ENV_BASE_URL = os.getenv("ENV_BASE_URL") or "https://myan9417-mailgym.hf.space"
+BENCHMARK = "mailgym"
 
-TEMPERATURE = 0.0  # Deterministic for reproducibility
+TEMPERATURE = 0.0          # Deterministic for reproducibility
 MAX_TOKENS = 500
-SEED = 42  # Fixed seed for reproducible email selection
+SEED = 42                  # Fixed seed for reproducible email selection
+SUCCESS_THRESHOLD = 0.5    # A task "succeeds" when score >= threshold
+
+TASKS = ["classify_easy", "triage_medium", "full_triage_hard"]
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = textwrap.dedent("""\
     You are an expert email triage assistant. You will be given an email and
-    a task description. You must respond with ONLY a valid JSON object matching
-    the required fields. Do not include any explanation or text outside the JSON.
+    a task description. Respond with ONLY a valid JSON object matching the
+    required fields. Do not include any explanation or text outside the JSON.
 
     Example responses:
     - Easy task: {"category": "urgent"}
@@ -49,12 +73,40 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 """)
 
 
-def build_user_prompt(observation: dict) -> str:
-    """Build the user prompt from an observation."""
-    email = observation.get("email", {})
-    task = observation.get("task", {})
+# ── Logging (STRICT format — do not edit casually) ───────────────────────────
 
-    prompt = textwrap.dedent(f"""\
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    # Single-line safety: collapse any newlines/carriage returns in the action string.
+    safe_action = action.replace("\n", " ").replace("\r", " ")
+    error_val = error.replace("\n", " ").replace("\r", " ") if error else "null"
+    done_val = "true" if done else "false"
+    print(
+        f"[STEP] step={step} action={safe_action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    success_val = "true" if success else "false"
+    print(
+        f"[END] success={success_val} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def build_user_prompt(observation: dict) -> str:
+    """Build the user prompt from an observation dict."""
+    email = observation.get("email") or {}
+    task = observation.get("task") or {}
+
+    return textwrap.dedent(f"""\
         EMAIL:
         From: {email.get('sender', 'unknown')}
         Subject: {email.get('subject', 'no subject')}
@@ -70,27 +122,24 @@ def build_user_prompt(observation: dict) -> str:
 
         Respond with ONLY a JSON object containing the required fields.
     """)
-    return prompt
 
 
 def parse_llm_response(response_text: str) -> dict:
-    """Parse the LLM response as JSON, handling common formatting issues."""
-    text = response_text.strip()
+    """Parse the LLM response as JSON, handling markdown fences and prose."""
+    text = (response_text or "").strip()
 
-    # Strip markdown code fences if present
+    # Strip markdown code fences.
     if text.startswith("```"):
-        lines = text.split("\n")
-        # Remove first and last lines (code fences)
-        lines = [l for l in lines if not l.strip().startswith("```")]
+        lines = [line for line in text.split("\n") if not line.strip().startswith("```")]
         text = "\n".join(lines).strip()
 
-    # Try parsing as JSON
+    # Direct JSON parse.
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try to find JSON object in the text
+    # Extract first {...} object from the text.
     start = text.find("{")
     end = text.rfind("}") + 1
     if start >= 0 and end > start:
@@ -99,116 +148,122 @@ def parse_llm_response(response_text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Fallback: return empty dict
-    print(f"  WARNING: Could not parse LLM response as JSON: {text[:200]}")
     return {}
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+def action_to_str(action: dict) -> str:
+    """Compact single-line string form of an action, for [STEP] logging."""
+    return json.dumps(action, separators=(",", ":"), ensure_ascii=False)
 
-def run_task(client: OpenAI, env_client, task_name: str, seed: int) -> float:
-    """Run a single task and return the score."""
-    import httpx
 
-    print(f"\n{'='*60}")
-    print(f"Task: {task_name}")
-    print(f"{'='*60}")
-
-    # Reset environment
-    reset_resp = env_client.post("/reset", json={"task_name": task_name, "seed": seed})
-    reset_resp.raise_for_status()
-    reset_data = reset_resp.json()
-
-    observation = reset_data["observation"]
-    print(f"  Email subject: {observation['email']['subject'][:60]}...")
-    print(f"  Task: {observation['task']['difficulty']} — {observation['task']['task_name']}")
-
-    # Build prompt and call LLM
+def call_llm(llm: OpenAI, observation: dict) -> dict:
+    """Call the LLM once and return a parsed action dict (possibly empty on failure)."""
     user_prompt = build_user_prompt(observation)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
-
     try:
-        completion = client.chat.completions.create(
+        completion = llm.chat.completions.create(
             model=MODEL_NAME,
-            messages=messages,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
         )
         response_text = completion.choices[0].message.content or ""
     except Exception as exc:
-        print(f"  LLM call failed: {exc}")
-        response_text = '{"category": "routine"}'
+        print(f"[DEBUG] LLM call failed: {exc}", file=sys.stderr, flush=True)
+        return {}
 
-    print(f"  LLM response: {response_text[:200]}")
+    return parse_llm_response(response_text)
 
-    # Parse response into action
-    action_dict = parse_llm_response(response_text)
-    print(f"  Parsed action: {json.dumps(action_dict)}")
 
-    # Submit action to environment
-    step_resp = env_client.post("/step", json={"action": action_dict})
-    step_resp.raise_for_status()
-    step_data = step_resp.json()
+# ── Task runner ──────────────────────────────────────────────────────────────
 
-    reward = step_data.get("reward", 0.0) or 0.0
-    feedback = step_data["observation"].get("feedback", "")
-    print(f"  Reward: {reward}")
-    print(f"  Feedback: {feedback}")
+def run_task(llm: OpenAI, env: httpx.Client, task_name: str) -> None:
+    """
+    Run a single task end-to-end.
 
-    return reward
+    Emits exactly one [START], one [STEP] per env.step(), and one [END],
+    even if any stage raises.
+    """
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+
+    try:
+        # 1. Reset.
+        reset_resp = env.post("/reset", json={"task_name": task_name, "seed": SEED})
+        reset_resp.raise_for_status()
+        reset_data = reset_resp.json()
+        observation = reset_data["observation"]
+
+        # 2. Ask the LLM for an action.
+        action_dict = call_llm(llm, observation)
+
+        # 3. Submit the action. Single-step episodes → steps_taken always 1.
+        step_num = 1
+        steps_taken = step_num
+        error: Optional[str] = None
+        reward = 0.0
+        done = False
+
+        try:
+            step_resp = env.post("/step", json={"action": action_dict})
+            step_resp.raise_for_status()
+            step_data = step_resp.json()
+            reward = float(step_data.get("reward") or 0.0)
+            done = bool(step_data.get("done", False))
+        except httpx.HTTPStatusError as http_err:
+            error = f"HTTP {http_err.response.status_code}: {http_err.response.text[:200]}"
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+
+        rewards.append(reward)
+        log_step(
+            step=step_num,
+            action=action_to_str(action_dict),
+            reward=reward,
+            done=done,
+            error=error,
+        )
+
+        # 4. Compute final score. Single step → score == reward, already in [0, 1].
+        score = max(0.0, min(1.0, reward))
+        success = score >= SUCCESS_THRESHOLD
+
+    except Exception as exc:
+        print(f"[DEBUG] run_task({task_name}) failed: {exc}", file=sys.stderr, flush=True)
+
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Run the baseline agent against all 3 tasks."""
     if not API_KEY:
-        print("ERROR: HF_TOKEN or API_KEY environment variable not set.")
-        sys.exit(1)
-    if not MODEL_NAME:
-        print("ERROR: MODEL_NAME environment variable not set.")
+        print("ERROR: HF_TOKEN or API_KEY environment variable not set.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"API Base URL: {API_BASE_URL}")
-    print(f"Model: {MODEL_NAME}")
-    print(f"Environment: {ENV_BASE_URL}")
+    llm = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    # Initialize clients
-    llm_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    with httpx.Client(base_url=ENV_BASE_URL, timeout=60.0) as env:
+        # Sanity-ping the environment before running tasks.
+        try:
+            health = env.get("/")
+            health.raise_for_status()
+        except Exception as exc:
+            print(
+                f"ERROR: Cannot reach environment at {ENV_BASE_URL}: {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
-    import httpx
-    env_client = httpx.Client(base_url=ENV_BASE_URL, timeout=30.0)
-
-    # Verify environment is running
-    try:
-        health = env_client.get("/")
-        health.raise_for_status()
-        print(f"Environment health: {health.json()}")
-    except Exception as exc:
-        print(f"ERROR: Cannot reach environment at {ENV_BASE_URL}: {exc}")
-        print("Start the server with: python -m server.app")
-        sys.exit(1)
-
-    tasks = ["classify_easy", "triage_medium", "full_triage_hard"]
-    scores = {}
-
-    for task_name in tasks:
-        score = run_task(llm_client, env_client, task_name, seed=SEED)
-        scores[task_name] = score
-
-    # Summary
-    print(f"\n{'='*60}")
-    print("BASELINE RESULTS")
-    print(f"{'='*60}")
-    for task, score in scores.items():
-        print(f"  {task:25s} → {score:.2f}")
-    avg = sum(scores.values()) / len(scores)
-    print(f"  {'Average':25s} → {avg:.2f}")
-    print(f"{'='*60}")
-
-    env_client.close()
+        for task_name in TASKS:
+            run_task(llm, env, task_name)
 
 
 if __name__ == "__main__":
