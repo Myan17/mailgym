@@ -11,6 +11,10 @@ tags:
   - email-triage
 ---
 
+> **Archived — superseded by [inbox-arena](https://github.com/Myan17/inbox-arena).**
+> InboxArena is the maintained version of this environment: it adds adversarial
+> perturbations, a pytest suite, a model-free policy baseline, and CI, and is
+> live at https://myan9417-inbox-arena.hf.space.
 
 # MailGym
 
